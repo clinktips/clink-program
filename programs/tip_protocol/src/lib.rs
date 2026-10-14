@@ -10,6 +10,9 @@
 //! - The refund deadline is fixed per tip at creation; the admin cannot extend it later.
 //! - The protocol fee is hard-capped at `MAX_FEE_BPS` and only charged on delivery, never on refunds.
 //! - Pausing blocks new tips only; claims and refunds always work.
+//! - Servers (Discord guilds, Telegram groups) can earn a share of the protocol fee from tips sent
+//!   in them. The share comes out of the fee, never out of the tip, and is capped below 100% of the
+//!   fee so tipping yourself in circles always costs money.
 
 use anchor_lang::prelude::*;
 use anchor_spl::{
@@ -26,11 +29,13 @@ declare_id!("D95BsuB9LaGnk68SedbwMKmvP6mr4wtXnoC3oU3Nckaw");
 pub const CONFIG_SEED: &[u8] = b"config";
 pub const LINK_SEED: &[u8] = b"link";
 pub const TIP_SEED: &[u8] = b"tip";
+pub const SERVER_SEED: &[u8] = b"server";
 
 pub const MAX_FEE_BPS: u16 = 500; // 5% hard cap
 pub const MIN_REFUND_SECS: i64 = 24 * 60 * 60; // 1 day
 pub const MAX_REFUND_SECS: i64 = 90 * 24 * 60 * 60; // 90 days
 pub const MAX_EXEMPT_MINTS: usize = 4;
+pub const MAX_SERVER_SHARE_BPS: u16 = 7_500; // at most 75% of the fee goes to the server
 
 #[program]
 pub mod tip_protocol {
@@ -73,6 +78,37 @@ pub mod tip_protocol {
         Ok(())
     }
 
+    /// Links a server (Discord guild / Telegram group) to the payout wallet of one of its admins.
+    /// The attestor co-signs only after the bot verified the caller's admin rights. Relinking keeps
+    /// any bonus the server has.
+    pub fn link_server(ctx: Context<LinkServer>, server_hash: [u8; 32]) -> Result<()> {
+        let server = &mut ctx.accounts.server;
+        server.server_hash = server_hash;
+        server.wallet = ctx.accounts.wallet.key();
+        server.bump = ctx.bumps.server;
+        emit!(ServerLinked {
+            server_hash,
+            wallet: server.wallet,
+        });
+        Ok(())
+    }
+
+    /// Admin-only, time-limited higher share for a server (e.g. founding servers).
+    pub fn set_server_bonus(
+        ctx: Context<SetServerBonus>,
+        bonus_share_bps: u16,
+        bonus_until: i64,
+    ) -> Result<()> {
+        require!(
+            bonus_share_bps <= MAX_SERVER_SHARE_BPS,
+            TipError::ServerShareTooHigh
+        );
+        let server = &mut ctx.accounts.server;
+        server.bonus_share_bps = bonus_share_bps;
+        server.bonus_until = bonus_until;
+        Ok(())
+    }
+
     /// Tip an identity that already linked a wallet: funds go straight to the recipient.
     pub fn tip_linked(ctx: Context<TipLinked>, identity_hash: [u8; 32], amount: u64) -> Result<()> {
         let config = &ctx.accounts.config;
@@ -81,6 +117,8 @@ pub mod tip_protocol {
 
         let fee = config.fee_for(&ctx.accounts.mint.key(), amount);
         let a = &ctx.accounts;
+        let (server_cut, server_token) =
+            server_payout(&a.config, fee, &a.server, &a.server_token, &a.mint.key())?;
         transfer(
             &a.token_program,
             &a.tipper_token,
@@ -96,9 +134,20 @@ pub mod tip_protocol {
             &a.treasury_token,
             a.tipper.to_account_info(),
             &a.mint,
-            fee,
+            fee - server_cut,
             &[],
         )?;
+        if let Some(server_token) = server_token {
+            transfer(
+                &a.token_program,
+                &a.tipper_token,
+                server_token,
+                a.tipper.to_account_info(),
+                &a.mint,
+                server_cut,
+                &[],
+            )?;
+        }
 
         emit!(TipSent {
             tipper: a.tipper.key(),
@@ -106,6 +155,8 @@ pub mod tip_protocol {
             mint: a.mint.key(),
             amount,
             fee,
+            server_cut,
+            server: a.server.as_ref().map(|s| s.key()),
             tip: None,
         });
         Ok(())
@@ -133,6 +184,12 @@ pub mod tip_protocol {
         tip.created_at = now;
         tip.expires_at = now + config.refund_after_secs;
         tip.bump = ctx.bumps.tip;
+        tip.server = ctx
+            .accounts
+            .server
+            .as_ref()
+            .map(|s| s.key())
+            .unwrap_or_default();
 
         let a = &ctx.accounts;
         transfer(
@@ -151,6 +208,8 @@ pub mod tip_protocol {
             mint: a.mint.key(),
             amount,
             fee: 0,
+            server_cut: 0,
+            server: a.server.as_ref().map(|s| s.key()),
             tip: Some(a.tip.key()),
         });
         Ok(())
@@ -162,6 +221,11 @@ pub mod tip_protocol {
         // Read the vault balance rather than `tip.amount` so Token-2022 transfer fees are handled.
         let amount = a.vault.amount;
         let fee = a.config.fee_for(&a.mint.key(), amount);
+        let recorded = a.tip.server;
+        let passed = a.server.as_ref().map(|s| s.key()).unwrap_or_default();
+        require_keys_eq!(passed, recorded, TipError::WrongServer);
+        let (server_cut, server_token) =
+            server_payout(&a.config, fee, &a.server, &a.server_token, &a.mint.key())?;
 
         let tipper_key = a.tip.tipper;
         let seed_bytes = a.tip.seed.to_le_bytes();
@@ -182,9 +246,20 @@ pub mod tip_protocol {
             &a.treasury_token,
             a.tip.to_account_info(),
             &a.mint,
-            fee,
+            fee - server_cut,
             signer,
         )?;
+        if let Some(server_token) = server_token {
+            transfer(
+                &a.token_program,
+                &a.vault,
+                server_token,
+                a.tip.to_account_info(),
+                &a.mint,
+                server_cut,
+                signer,
+            )?;
+        }
         close_vault(&a.token_program, &a.vault, &a.tipper, a.tip.to_account_info(), signer)?;
 
         emit!(TipClaimed {
@@ -192,6 +267,7 @@ pub mod tip_protocol {
             wallet: a.wallet.key(),
             amount,
             fee,
+            server_cut,
         });
         Ok(())
     }
@@ -273,6 +349,28 @@ fn close_vault<'info>(
     ))
 }
 
+/// Validates the optional server accounts and returns the server's cut of `fee`.
+/// Either both server accounts are passed or neither; the token account must belong to the
+/// server's linked payout wallet and hold the tip's mint.
+fn server_payout<'a, 'info>(
+    config: &Config,
+    fee: u64,
+    server: &Option<Account<'info, ServerLink>>,
+    server_token: &'a Option<InterfaceAccount<'info, TokenAccount>>,
+    mint: &Pubkey,
+) -> Result<(u64, Option<&'a InterfaceAccount<'info, TokenAccount>>)> {
+    match (server, server_token) {
+        (None, None) => Ok((0, None)),
+        (Some(server), Some(token)) => {
+            require_keys_eq!(token.owner, server.wallet, TipError::WrongServerWallet);
+            require_keys_eq!(token.mint, *mint, TipError::WrongServerWallet);
+            let now = Clock::get()?.unix_timestamp;
+            Ok((config.server_cut(fee, server, now), Some(token)))
+        }
+        _ => err!(TipError::WrongServerWallet),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Accounts
 // ---------------------------------------------------------------------------
@@ -317,6 +415,34 @@ pub struct LinkIdentity<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(server_hash: [u8; 32])]
+pub struct LinkServer<'info> {
+    #[account(seeds = [CONFIG_SEED], bump = config.bump, has_one = attestor @ TipError::Unauthorized)]
+    pub config: Account<'info, Config>,
+    pub attestor: Signer<'info>,
+    #[account(mut)]
+    pub wallet: Signer<'info>,
+    #[account(
+        init_if_needed,
+        payer = wallet,
+        space = 8 + ServerLink::INIT_SPACE,
+        seeds = [SERVER_SEED, server_hash.as_ref()],
+        bump
+    )]
+    pub server: Account<'info, ServerLink>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct SetServerBonus<'info> {
+    #[account(seeds = [CONFIG_SEED], bump = config.bump, has_one = admin @ TipError::Unauthorized)]
+    pub config: Account<'info, Config>,
+    pub admin: Signer<'info>,
+    #[account(mut, seeds = [SERVER_SEED, server.server_hash.as_ref()], bump = server.bump)]
+    pub server: Account<'info, ServerLink>,
+}
+
+#[derive(Accounts)]
 #[instruction(identity_hash: [u8; 32])]
 pub struct TipLinked<'info> {
     #[account(seeds = [CONFIG_SEED], bump = config.bump)]
@@ -351,6 +477,11 @@ pub struct TipLinked<'info> {
         associated_token::token_program = token_program
     )]
     pub treasury_token: InterfaceAccount<'info, TokenAccount>,
+    #[account(seeds = [SERVER_SEED, server.server_hash.as_ref()], bump = server.bump)]
+    pub server: Option<Account<'info, ServerLink>>,
+    /// Payout token account of the server's wallet (checked in `server_payout`).
+    #[account(mut)]
+    pub server_token: Option<InterfaceAccount<'info, TokenAccount>>,
     pub token_program: Interface<'info, TokenInterface>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
@@ -383,6 +514,8 @@ pub struct TipEscrow<'info> {
         associated_token::token_program = token_program
     )]
     pub vault: InterfaceAccount<'info, TokenAccount>,
+    #[account(seeds = [SERVER_SEED, server.server_hash.as_ref()], bump = server.bump)]
+    pub server: Option<Account<'info, ServerLink>>,
     pub token_program: Interface<'info, TokenInterface>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
@@ -440,6 +573,11 @@ pub struct ClaimTip<'info> {
         associated_token::token_program = token_program
     )]
     pub treasury_token: InterfaceAccount<'info, TokenAccount>,
+    #[account(seeds = [SERVER_SEED, server.server_hash.as_ref()], bump = server.bump)]
+    pub server: Option<Account<'info, ServerLink>>,
+    /// Payout token account of the server's wallet (checked in `server_payout`).
+    #[account(mut)]
+    pub server_token: Option<InterfaceAccount<'info, TokenAccount>>,
     pub token_program: Interface<'info, TokenInterface>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
@@ -493,6 +631,8 @@ pub struct ConfigParams {
     /// Mints that pay no protocol fee (e.g. the project's own coin once it launches).
     pub fee_exempt_mints: Vec<Pubkey>,
     pub paused: bool,
+    /// Share of the fee paid to the server a tip was sent in, in bps of the fee.
+    pub server_share_bps: u16,
 }
 
 impl ConfigParams {
@@ -505,6 +645,10 @@ impl ConfigParams {
         require!(
             self.fee_exempt_mints.len() <= MAX_EXEMPT_MINTS,
             TipError::TooManyExemptMints
+        );
+        require!(
+            self.server_share_bps <= MAX_SERVER_SHARE_BPS,
+            TipError::ServerShareTooHigh
         );
         Ok(())
     }
@@ -522,6 +666,7 @@ pub struct Config {
     #[max_len(4)]
     pub fee_exempt_mints: Vec<Pubkey>,
     pub bump: u8,
+    pub server_share_bps: u16,
 }
 
 impl Config {
@@ -532,6 +677,18 @@ impl Config {
         self.refund_after_secs = p.refund_after_secs;
         self.fee_exempt_mints = p.fee_exempt_mints;
         self.paused = p.paused;
+        self.server_share_bps = p.server_share_bps;
+    }
+
+    /// The server's part of `fee`; a running bonus overrides the default share.
+    pub fn server_cut(&self, fee: u64, server: &ServerLink, now: i64) -> u64 {
+        let bps = if now < server.bonus_until {
+            server.bonus_share_bps
+        } else {
+            self.server_share_bps
+        };
+        // Both shares are capped at MAX_SERVER_SHARE_BPS, so this never exceeds `fee`.
+        ((fee as u128) * (bps.min(MAX_SERVER_SHARE_BPS) as u128) / 10_000) as u64
     }
 
     pub fn fee_for(&self, mint: &Pubkey, amount: u64) -> u64 {
@@ -563,6 +720,18 @@ pub struct Tip {
     pub created_at: i64,
     pub expires_at: i64,
     pub bump: u8,
+    /// ServerLink the tip was sent in, or the default key for none.
+    pub server: Pubkey,
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct ServerLink {
+    pub server_hash: [u8; 32],
+    pub wallet: Pubkey,
+    pub bonus_share_bps: u16,
+    pub bonus_until: i64,
+    pub bump: u8,
 }
 
 // ---------------------------------------------------------------------------
@@ -582,6 +751,8 @@ pub struct TipSent {
     pub mint: Pubkey,
     pub amount: u64,
     pub fee: u64,
+    pub server_cut: u64,
+    pub server: Option<Pubkey>,
     /// Escrow account if the recipient hasn't linked a wallet yet.
     pub tip: Option<Pubkey>,
 }
@@ -592,6 +763,13 @@ pub struct TipClaimed {
     pub wallet: Pubkey,
     pub amount: u64,
     pub fee: u64,
+    pub server_cut: u64,
+}
+
+#[event]
+pub struct ServerLinked {
+    pub server_hash: [u8; 32],
+    pub wallet: Pubkey,
 }
 
 #[event]
@@ -621,4 +799,10 @@ pub enum TipError {
     WrongTreasury,
     #[msg("Tip has not expired yet")]
     NotExpired,
+    #[msg("Server share exceeds the hard cap")]
+    ServerShareTooHigh,
+    #[msg("Server payout account does not match the server's wallet")]
+    WrongServerWallet,
+    #[msg("Server does not match the one the tip was sent in")]
+    WrongServer,
 }
