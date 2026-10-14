@@ -1,0 +1,23 @@
+[package]
+name = "tip-protocol"
+version = "0.1.0"
+description = "Non-custodial social tipping on Solana"
+edition = "2021"
+# Solana platform-tools ship an older rustc; keeps the lockfile on compatible crate versions.
+rust-version = "1.79"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "tip_protocol"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+anchor-lang = { version = "0.31.1", features = ["init-if-needed"] }
+anchor-spl = "0.31.1"
