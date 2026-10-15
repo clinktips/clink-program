@@ -17,7 +17,9 @@ Tips are addressed to a social identity, `sha256("tipproto:v1:<platform>:<user i
 
 - **Recipient has linked a wallet:** `tip_linked` sends the tip straight to it.
 - **Recipient hasn't linked one yet:** `tip_escrow` locks the tip in an account only this program controls. The recipient collects it with `claim_tip` after linking a wallet, or the tipper takes it back with `refund_tip` once it expires.
+- **SOL** has its own instructions (`tip_linked_sol`, `claim_tip_sol`) that move plain SOL, so recipients never end up holding wrapped SOL.
 - **Linking** (`link_identity`) needs a co-signature from the clink attestor, given only after the person logs in with that Discord or Telegram account.
+- **Recipients don't have to sign.** Linking and claiming take a separate payer, so clink can pay the fees for someone who only pasted their address. The payout still goes only to the identity's linked wallet; the program checks it on every claim.
 - **Servers** (Discord servers, Telegram groups) can link a payout wallet (`link_server`) and receive part of the protocol fee from tips sent in them.
 
 ## What the program guarantees
