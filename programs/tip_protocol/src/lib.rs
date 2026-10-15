@@ -10,6 +10,9 @@
 //! - The refund deadline is fixed per tip at creation; the admin cannot extend it later.
 //! - The protocol fee is hard-capped at `MAX_FEE_BPS` and only charged on delivery, never on refunds.
 //! - Pausing blocks new tips only; claims and refunds always work.
+//! - The attestor can link a new identity instantly, but it can never silently move an existing
+//!   link: switching to another wallet waits `RELINK_DELAY_SECS`, tips keep going to the current
+//!   wallet meanwhile, and the current wallet can cancel the switch on its own.
 //! - Servers (Discord guilds, Telegram groups) can earn a share of the protocol fee from tips sent
 //!   in them. The share comes out of the fee, never out of the tip, and is capped below 100% of the
 //!   fee so tipping yourself in circles always costs money.
@@ -36,6 +39,7 @@ pub const MIN_REFUND_SECS: i64 = 24 * 60 * 60; // 1 day
 pub const MAX_REFUND_SECS: i64 = 90 * 24 * 60 * 60; // 90 days
 pub const MAX_EXEMPT_MINTS: usize = 4;
 pub const MAX_SERVER_SHARE_BPS: u16 = 7_500; // at most 75% of the fee goes to the server
+pub const RELINK_DELAY_SECS: i64 = 3 * 24 * 60 * 60; // 3 days to notice and cancel a wallet switch
 
 #[program]
 pub mod tip_protocol {
@@ -58,21 +62,68 @@ pub mod tip_protocol {
         Ok(())
     }
 
+    /// Step 1 of an admin handover: names the next admin. Nothing changes until it accepts, so a
+    /// mistyped address can't lock the config forever; calling this again replaces the proposal.
     pub fn set_admin(ctx: Context<UpdateConfig>, new_admin: Pubkey) -> Result<()> {
-        ctx.accounts.config.admin = new_admin;
+        ctx.accounts.config.pending_admin = new_admin;
+        Ok(())
+    }
+
+    /// Step 2: the proposed admin (e.g. a multisig vault) signs to take over.
+    pub fn accept_admin(ctx: Context<AcceptAdmin>) -> Result<()> {
+        let config = &mut ctx.accounts.config;
+        config.admin = ctx.accounts.new_admin.key();
+        config.pending_admin = Pubkey::default();
         Ok(())
     }
 
     /// Links a social identity to a wallet. The attestor (our backend) co-signs only after the
     /// user proved ownership of the account via OAuth / Telegram login.
+    ///
+    /// A first link takes effect at once. If the identity is already linked to another wallet, the
+    /// new wallet only becomes pending and takes over after `RELINK_DELAY_SECS`, so a leaked
+    /// attestor key can't redirect anyone's tips without them having days to cancel.
     pub fn link_identity(ctx: Context<LinkIdentity>, identity_hash: [u8; 32]) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let wallet = ctx.accounts.wallet.key();
         let link = &mut ctx.accounts.link;
-        link.identity_hash = identity_hash;
-        link.wallet = ctx.accounts.wallet.key();
-        link.linked_at = Clock::get()?.unix_timestamp;
-        link.bump = ctx.bumps.link;
-        emit!(IdentityLinked {
-            identity_hash,
+        link.settle(now);
+        if link.wallet == Pubkey::default() {
+            link.identity_hash = identity_hash;
+            link.wallet = wallet;
+            link.linked_at = now;
+            link.bump = ctx.bumps.link;
+            emit!(IdentityLinked {
+                identity_hash,
+                wallet,
+            });
+        } else if link.wallet == wallet {
+            // Linking the current wallet again (signed by it) drops any pending switch.
+            link.clear_pending();
+        } else if link.pending_wallet != wallet {
+            // Asking again for the wallet that is already pending keeps its original timer.
+            link.pending_wallet = wallet;
+            link.pending_at = now + RELINK_DELAY_SECS;
+            emit!(RelinkRequested {
+                identity_hash,
+                wallet: link.wallet,
+                pending_wallet: wallet,
+                effective_at: link.pending_at,
+            });
+        }
+        Ok(())
+    }
+
+    /// The currently linked wallet stops a pending switch. Needs no attestor, so it works even
+    /// if the backend is down or compromised.
+    pub fn cancel_relink(ctx: Context<CancelRelink>) -> Result<()> {
+        let link = &mut ctx.accounts.link;
+        link.settle(Clock::get()?.unix_timestamp);
+        require_keys_eq!(ctx.accounts.wallet.key(), link.wallet, TipError::Unauthorized);
+        require!(link.pending_wallet != Pubkey::default(), TipError::NoPendingRelink);
+        link.clear_pending();
+        emit!(RelinkCancelled {
+            identity_hash: link.identity_hash,
             wallet: link.wallet,
         });
         Ok(())
@@ -114,6 +165,12 @@ pub mod tip_protocol {
         let config = &ctx.accounts.config;
         require!(!config.paused, TipError::Paused);
         require!(amount > 0, TipError::ZeroAmount);
+        let now = Clock::get()?.unix_timestamp;
+        require_keys_eq!(
+            ctx.accounts.recipient.key(),
+            ctx.accounts.link.current_wallet(now),
+            TipError::WrongRecipient
+        );
 
         let fee = config.fee_for(&ctx.accounts.mint.key(), amount);
         let a = &ctx.accounts;
@@ -218,6 +275,11 @@ pub mod tip_protocol {
     /// Recipient (the wallet linked to the tip's identity) collects an escrowed tip.
     pub fn claim_tip(ctx: Context<ClaimTip>) -> Result<()> {
         let a = &ctx.accounts;
+        require_keys_eq!(
+            a.wallet.key(),
+            a.link.current_wallet(Clock::get()?.unix_timestamp),
+            TipError::WrongRecipient
+        );
         // Read the vault balance rather than `tip.amount` so Token-2022 transfer fees are handled.
         let amount = a.vault.amount;
         let fee = a.config.fee_for(&a.mint.key(), amount);
@@ -396,6 +458,19 @@ pub struct UpdateConfig<'info> {
 }
 
 #[derive(Accounts)]
+pub struct AcceptAdmin<'info> {
+    #[account(
+        mut,
+        seeds = [CONFIG_SEED],
+        bump = config.bump,
+        constraint = config.pending_admin != Pubkey::default() @ TipError::Unauthorized,
+        constraint = config.pending_admin == new_admin.key() @ TipError::Unauthorized
+    )]
+    pub config: Account<'info, Config>,
+    pub new_admin: Signer<'info>,
+}
+
+#[derive(Accounts)]
 #[instruction(identity_hash: [u8; 32])]
 pub struct LinkIdentity<'info> {
     #[account(seeds = [CONFIG_SEED], bump = config.bump, has_one = attestor @ TipError::Unauthorized)]
@@ -412,6 +487,13 @@ pub struct LinkIdentity<'info> {
     )]
     pub link: Account<'info, IdentityLink>,
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct CancelRelink<'info> {
+    pub wallet: Signer<'info>,
+    #[account(mut, seeds = [LINK_SEED, link.identity_hash.as_ref()], bump = link.bump)]
+    pub link: Account<'info, IdentityLink>,
 }
 
 #[derive(Accounts)]
@@ -451,8 +533,7 @@ pub struct TipLinked<'info> {
     pub tipper: Signer<'info>,
     #[account(seeds = [LINK_SEED, identity_hash.as_ref()], bump = link.bump)]
     pub link: Account<'info, IdentityLink>,
-    /// CHECK: must be the wallet linked to the identity.
-    #[account(address = link.wallet @ TipError::WrongRecipient)]
+    /// CHECK: must be the identity's current wallet (checked in the handler).
     pub recipient: UncheckedAccount<'info>,
     #[account(mint::token_program = token_program)]
     pub mint: InterfaceAccount<'info, Mint>,
@@ -541,11 +622,8 @@ pub struct ClaimTip<'info> {
     pub tipper: UncheckedAccount<'info>,
     #[account(mint::token_program = token_program)]
     pub mint: InterfaceAccount<'info, Mint>,
-    #[account(
-        seeds = [LINK_SEED, tip.identity_hash.as_ref()],
-        bump = link.bump,
-        has_one = wallet @ TipError::WrongRecipient
-    )]
+    /// Must point at `wallet` (checked in the handler, pending switches included).
+    #[account(seeds = [LINK_SEED, tip.identity_hash.as_ref()], bump = link.bump)]
     pub link: Account<'info, IdentityLink>,
     #[account(
         mut,
@@ -667,6 +745,8 @@ pub struct Config {
     pub fee_exempt_mints: Vec<Pubkey>,
     pub bump: u8,
     pub server_share_bps: u16,
+    /// Proposed next admin (see `set_admin`), or the default key for none.
+    pub pending_admin: Pubkey,
 }
 
 impl Config {
@@ -707,6 +787,39 @@ pub struct IdentityLink {
     pub wallet: Pubkey,
     pub linked_at: i64,
     pub bump: u8,
+    /// Wallet waiting to take over, or the default key for none.
+    pub pending_wallet: Pubkey,
+    /// When `pending_wallet` takes over.
+    pub pending_at: i64,
+}
+
+impl IdentityLink {
+    fn has_pending(&self) -> bool {
+        self.pending_wallet != Pubkey::default()
+    }
+
+    /// The wallet tips go to right now: the pending one once its delay has passed.
+    pub fn current_wallet(&self, now: i64) -> Pubkey {
+        if self.has_pending() && now >= self.pending_at {
+            self.pending_wallet
+        } else {
+            self.wallet
+        }
+    }
+
+    /// Writes a switch whose delay has passed into `wallet`.
+    fn settle(&mut self, now: i64) {
+        if self.has_pending() && now >= self.pending_at {
+            self.wallet = self.pending_wallet;
+            self.linked_at = self.pending_at;
+            self.clear_pending();
+        }
+    }
+
+    fn clear_pending(&mut self) {
+        self.pending_wallet = Pubkey::default();
+        self.pending_at = 0;
+    }
 }
 
 #[account]
@@ -740,6 +853,20 @@ pub struct ServerLink {
 
 #[event]
 pub struct IdentityLinked {
+    pub identity_hash: [u8; 32],
+    pub wallet: Pubkey,
+}
+
+#[event]
+pub struct RelinkRequested {
+    pub identity_hash: [u8; 32],
+    pub wallet: Pubkey,
+    pub pending_wallet: Pubkey,
+    pub effective_at: i64,
+}
+
+#[event]
+pub struct RelinkCancelled {
     pub identity_hash: [u8; 32],
     pub wallet: Pubkey,
 }
@@ -805,4 +932,58 @@ pub enum TipError {
     WrongServerWallet,
     #[msg("Server does not match the one the tip was sent in")]
     WrongServer,
+    #[msg("No wallet switch is pending")]
+    NoPendingRelink,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn link(wallet: Pubkey) -> IdentityLink {
+        IdentityLink {
+            identity_hash: [7; 32],
+            wallet,
+            linked_at: 0,
+            bump: 255,
+            pending_wallet: Pubkey::default(),
+            pending_at: 0,
+        }
+    }
+
+    #[test]
+    fn pending_switch_waits_for_the_delay() {
+        let (old, new) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let mut l = link(old);
+        l.pending_wallet = new;
+        l.pending_at = 1_000 + RELINK_DELAY_SECS;
+        assert_eq!(l.current_wallet(1_000), old);
+        assert_eq!(l.current_wallet(l.pending_at - 1), old);
+        assert_eq!(l.current_wallet(l.pending_at), new);
+    }
+
+    #[test]
+    fn settle_applies_only_a_due_switch() {
+        let (old, new) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let mut l = link(old);
+        l.pending_wallet = new;
+        l.pending_at = 5_000;
+
+        l.settle(4_999);
+        assert_eq!((l.wallet, l.pending_wallet), (old, new));
+
+        l.settle(5_000);
+        assert_eq!(l.wallet, new);
+        assert_eq!(l.linked_at, 5_000);
+        assert!(!l.has_pending());
+        assert_eq!(l.current_wallet(9_999), new);
+    }
+
+    #[test]
+    fn no_pending_means_current_wallet_never_changes() {
+        let old = Pubkey::new_unique();
+        let mut l = link(old);
+        l.settle(i64::MAX);
+        assert_eq!(l.current_wallet(i64::MAX), old);
+    }
 }
