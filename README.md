@@ -56,7 +56,19 @@ These unit tests cover the wallet-switch timing. The end-to-end suite (26 checks
 
 ## Verified build
 
-Once deployed, the program will be submitted for a verified build, so explorers can show that the deployed bytecode matches a commit in this repository. Until then, treat the program id above as unverified.
+You can check that the program on devnet is built from this repository. Build it in the Anchor image, pinned by digest so everyone gets the same compiler, then compare it with the deployed bytes:
+
+```
+docker run --rm -v "$PWD:/src:ro" solanafoundation/anchor@sha256:21ab8a16e19df4301a198d7a55ab2988549aa2d996e6b5ad229c1d95b9f2d326 bash -lc '
+  cp -r /src /build && cd /build &&
+  cargo build-sbf --manifest-path programs/tip_protocol/Cargo.toml -- --locked >/dev/null 2>&1 &&
+  solana program dump -u devnet D95BsuB9LaGnk68SedbwMKmvP6mr4wtXnoC3oU3Nckaw /tmp/onchain.so >/dev/null &&
+  for f in target/deploy/tip_protocol.so /tmp/onchain.so; do python3 -c "import sys,hashlib;print(hashlib.sha256(open(sys.argv[1],\"rb\").read().rstrip(b\"\0\")).hexdigest())" $f; done'
+```
+
+Both lines print the same hash. Trailing zero bytes are stripped first, because the program account is larger than the program. This is the same hash `solana-verify get-program-hash` reports. At the current commit the hash is `0a898fc2672be153c07a64b00d99918b332301300c1b034f0da4d080c71aa339`.
+
+Explorers show a "Verified" badge only on mainnet, because the public verification service doesn't support devnet. The mainnet program will be submitted there at launch.
 
 ## Reporting a vulnerability
 
