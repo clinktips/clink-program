@@ -1,6 +1,6 @@
 # clink program
 
-The on-chain program behind [clink](https://clink.tips): non-custodial tipping on Solana for Discord and Telegram.
+The on-chain program behind [clink](https://clinktips.com): non-custodial tipping on Solana for Discord and Telegram.
 
 This repository holds the code that moves money, so anyone can read exactly what it does and check that it matches what is deployed. The bots, backend and website only build transactions; every payment is signed in the user's own wallet and runs through this program.
 
