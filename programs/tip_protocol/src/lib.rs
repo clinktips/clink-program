@@ -10,6 +10,8 @@
 //! - The refund deadline is fixed per tip at creation; the admin cannot extend it later.
 //! - The protocol fee is hard-capped at `MAX_FEE_BPS` and only charged on delivery, never on refunds.
 //! - Pausing blocks new tips only; claims and refunds always work.
+//! - Linking and claiming don't need the recipient's signature (a relayer can pay the fees), but
+//!   escrowed tips can only ever go to the identity's linked wallet.
 //! - The attestor can link a new identity instantly, but it can never silently move an existing
 //!   link: switching to another wallet waits `RELINK_DELAY_SECS`, tips keep going to the current
 //!   wallet meanwhile, and the current wallet can cancel the switch on its own.
@@ -39,6 +41,8 @@ pub const MIN_REFUND_SECS: i64 = 24 * 60 * 60; // 1 day
 pub const MAX_REFUND_SECS: i64 = 90 * 24 * 60 * 60; // 90 days
 pub const MAX_EXEMPT_MINTS: usize = 4;
 pub const MAX_SERVER_SHARE_BPS: u16 = 7_500; // at most 75% of the fee goes to the server
+/// Wrapped SOL. SOL tips sent with the `_sol` instructions arrive as plain SOL instead.
+pub const NATIVE_MINT: Pubkey = pubkey!("So11111111111111111111111111111111111111112");
 pub const RELINK_DELAY_SECS: i64 = 3 * 24 * 60 * 60; // 3 days to notice and cancel a wallet switch
 
 #[program]
@@ -78,7 +82,9 @@ pub mod tip_protocol {
     }
 
     /// Links a social identity to a wallet. The attestor (our backend) co-signs only after the
-    /// user proved ownership of the account via OAuth / Telegram login.
+    /// user proved ownership of the account via OAuth / Telegram login. `payer` pays the rent: the
+    /// user's own wallet when they connect it, or a relayer when they only paste their address, so
+    /// the wallet itself doesn't have to sign.
     ///
     /// A first link takes effect at once. If the identity is already linked to another wallet, the
     /// new wallet only becomes pending and takes over after `RELINK_DELAY_SECS`, so a leaked
@@ -272,7 +278,8 @@ pub mod tip_protocol {
         Ok(())
     }
 
-    /// Recipient (the wallet linked to the tip's identity) collects an escrowed tip.
+    /// Collects an escrowed tip into the wallet linked to the tip's identity. Anyone may send it
+    /// (the recipient, or a relayer paying the fees): the destination is fixed by the link.
     pub fn claim_tip(ctx: Context<ClaimTip>) -> Result<()> {
         let a = &ctx.accounts;
         require_keys_eq!(
@@ -323,6 +330,86 @@ pub mod tip_protocol {
             )?;
         }
         close_vault(&a.token_program, &a.vault, &a.tipper, a.tip.to_account_info(), signer)?;
+
+        emit!(TipClaimed {
+            tip: a.tip.key(),
+            wallet: a.wallet.key(),
+            amount,
+            fee,
+            server_cut,
+        });
+        Ok(())
+    }
+
+    /// Like `tip_linked`, for SOL: moves plain SOL with system transfers, so the recipient gets
+    /// SOL rather than a wrapped-SOL token account they would have to unwrap themselves.
+    pub fn tip_linked_sol(
+        ctx: Context<TipLinkedSol>,
+        identity_hash: [u8; 32],
+        amount: u64,
+    ) -> Result<()> {
+        let a = &ctx.accounts;
+        require!(!a.config.paused, TipError::Paused);
+        require!(amount > 0, TipError::ZeroAmount);
+        require_keys_eq!(
+            a.recipient.key(),
+            a.link.current_wallet(Clock::get()?.unix_timestamp),
+            TipError::WrongRecipient
+        );
+        let fee = a.config.fee_for(&NATIVE_MINT, amount);
+        let server_cut = sol_server_cut(&a.config, fee, &a.server, &a.server_wallet)?;
+
+        let from = a.tipper.to_account_info();
+        sol_transfer(&a.system_program, &from, &a.recipient, amount - fee)?;
+        sol_transfer(&a.system_program, &from, &a.treasury, fee - server_cut)?;
+        if let Some(server_wallet) = &a.server_wallet {
+            sol_transfer(&a.system_program, &from, server_wallet, server_cut)?;
+        }
+
+        emit!(TipSent {
+            tipper: a.tipper.key(),
+            identity_hash,
+            mint: NATIVE_MINT,
+            amount,
+            fee,
+            server_cut,
+            server: a.server.as_ref().map(|s| s.key()),
+            tip: None,
+        });
+        Ok(())
+    }
+
+    /// Like `claim_tip`, for escrowed SOL: unwraps the vault and pays out plain SOL. The tipper
+    /// still gets back the rent of both the tip and the vault account.
+    pub fn claim_tip_sol(ctx: Context<ClaimTipSol>) -> Result<()> {
+        let a = &ctx.accounts;
+        require_keys_eq!(
+            a.wallet.key(),
+            a.link.current_wallet(Clock::get()?.unix_timestamp),
+            TipError::WrongRecipient
+        );
+        let amount = a.vault.amount;
+        let fee = a.config.fee_for(&NATIVE_MINT, amount);
+        let recorded = a.tip.server;
+        let passed = a.server.as_ref().map(|s| s.key()).unwrap_or_default();
+        require_keys_eq!(passed, recorded, TipError::WrongServer);
+        let server_cut = sol_server_cut(&a.config, fee, &a.server, &a.server_wallet)?;
+
+        let tipper_key = a.tip.tipper;
+        let seed_bytes = a.tip.seed.to_le_bytes();
+        let signer: &[&[&[u8]]] = &[&[TIP_SEED, tipper_key.as_ref(), &seed_bytes, &[a.tip.bump]]];
+
+        // Closing a wrapped-SOL account releases all its lamports: the tip plus the account's rent.
+        // Close it into the tip account (owned by this program), hand out the tip from there, and
+        // let `close = tipper` return what's left (both accounts' rent) to the tipper.
+        let tip_info = a.tip.to_account_info();
+        close_vault(&a.token_program, &a.vault, &tip_info, tip_info.clone(), signer)?;
+        tip_info.sub_lamports(amount)?;
+        a.wallet.add_lamports(amount - fee)?;
+        a.treasury.add_lamports(fee - server_cut)?;
+        if let Some(server_wallet) = &a.server_wallet {
+            server_wallet.add_lamports(server_cut)?;
+        }
 
         emit!(TipClaimed {
             tip: a.tip.key(),
@@ -411,6 +498,42 @@ fn close_vault<'info>(
     ))
 }
 
+fn sol_transfer<'info>(
+    system_program: &Program<'info, System>,
+    from: &AccountInfo<'info>,
+    to: &AccountInfo<'info>,
+    amount: u64,
+) -> Result<()> {
+    if amount == 0 {
+        return Ok(());
+    }
+    let accounts = anchor_lang::system_program::Transfer {
+        from: from.clone(),
+        to: to.clone(),
+    };
+    anchor_lang::system_program::transfer(
+        CpiContext::new(system_program.to_account_info(), accounts),
+        amount,
+    )
+}
+
+/// `server_payout` for SOL: pays the server's wallet itself instead of a token account.
+fn sol_server_cut<'info>(
+    config: &Config,
+    fee: u64,
+    server: &Option<Account<'info, ServerLink>>,
+    server_wallet: &Option<UncheckedAccount<'info>>,
+) -> Result<u64> {
+    match (server, server_wallet) {
+        (None, None) => Ok(0),
+        (Some(server), Some(wallet)) => {
+            require_keys_eq!(wallet.key(), server.wallet, TipError::WrongServerWallet);
+            Ok(config.server_cut(fee, server, Clock::get()?.unix_timestamp))
+        }
+        _ => err!(TipError::WrongServerWallet),
+    }
+}
+
 /// Validates the optional server accounts and returns the server's cut of `fee`.
 /// Either both server accounts are passed or neither; the token account must belong to the
 /// server's linked payout wallet and hold the tip's mint.
@@ -477,10 +600,12 @@ pub struct LinkIdentity<'info> {
     pub config: Account<'info, Config>,
     pub attestor: Signer<'info>,
     #[account(mut)]
-    pub wallet: Signer<'info>,
+    pub payer: Signer<'info>,
+    /// CHECK: the wallet the identity's owner chose; the attestor vouches for the identity, not the key.
+    pub wallet: UncheckedAccount<'info>,
     #[account(
         init_if_needed,
-        payer = wallet,
+        payer = payer,
         space = 8 + IdentityLink::INIT_SPACE,
         seeds = [LINK_SEED, identity_hash.as_ref()],
         bump
@@ -606,8 +731,11 @@ pub struct TipEscrow<'info> {
 pub struct ClaimTip<'info> {
     #[account(seeds = [CONFIG_SEED], bump = config.bump)]
     pub config: Account<'info, Config>,
+    /// Pays for any token accounts that need creating: the recipient or a relayer.
     #[account(mut)]
-    pub wallet: Signer<'info>,
+    pub payer: Signer<'info>,
+    /// CHECK: must be the identity's current wallet (checked in the handler).
+    pub wallet: UncheckedAccount<'info>,
     #[account(
         mut,
         close = tipper,
@@ -634,7 +762,7 @@ pub struct ClaimTip<'info> {
     pub vault: InterfaceAccount<'info, TokenAccount>,
     #[account(
         init_if_needed,
-        payer = wallet,
+        payer = payer,
         associated_token::mint = mint,
         associated_token::authority = wallet,
         associated_token::token_program = token_program
@@ -645,7 +773,7 @@ pub struct ClaimTip<'info> {
     pub treasury: UncheckedAccount<'info>,
     #[account(
         init_if_needed,
-        payer = wallet,
+        payer = payer,
         associated_token::mint = mint,
         associated_token::authority = treasury,
         associated_token::token_program = token_program
@@ -659,6 +787,72 @@ pub struct ClaimTip<'info> {
     pub token_program: Interface<'info, TokenInterface>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(identity_hash: [u8; 32])]
+pub struct TipLinkedSol<'info> {
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Account<'info, Config>,
+    #[account(mut)]
+    pub tipper: Signer<'info>,
+    #[account(seeds = [LINK_SEED, identity_hash.as_ref()], bump = link.bump)]
+    pub link: Account<'info, IdentityLink>,
+    /// CHECK: must be the identity's current wallet (checked in the handler).
+    #[account(mut)]
+    pub recipient: UncheckedAccount<'info>,
+    /// CHECK: fee recipient from config.
+    #[account(mut, address = config.treasury @ TipError::WrongTreasury)]
+    pub treasury: UncheckedAccount<'info>,
+    #[account(seeds = [SERVER_SEED, server.server_hash.as_ref()], bump = server.bump)]
+    pub server: Option<Account<'info, ServerLink>>,
+    /// CHECK: the server's payout wallet (checked in `sol_server_cut`).
+    #[account(mut)]
+    pub server_wallet: Option<UncheckedAccount<'info>>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ClaimTipSol<'info> {
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Account<'info, Config>,
+    /// Pays the transaction fee: the recipient or a relayer. Nothing needs creating here.
+    pub payer: Signer<'info>,
+    /// CHECK: must be the identity's current wallet (checked in the handler).
+    #[account(mut)]
+    pub wallet: UncheckedAccount<'info>,
+    #[account(
+        mut,
+        close = tipper,
+        has_one = tipper,
+        has_one = mint,
+        seeds = [TIP_SEED, tip.tipper.as_ref(), &tip.seed.to_le_bytes()],
+        bump = tip.bump
+    )]
+    pub tip: Account<'info, Tip>,
+    /// CHECK: receives the rent of the closed tip and vault accounts (checked via has_one).
+    #[account(mut)]
+    pub tipper: UncheckedAccount<'info>,
+    #[account(address = NATIVE_MINT @ TipError::NotSol, mint::token_program = token_program)]
+    pub mint: InterfaceAccount<'info, Mint>,
+    #[account(seeds = [LINK_SEED, tip.identity_hash.as_ref()], bump = link.bump)]
+    pub link: Account<'info, IdentityLink>,
+    #[account(
+        mut,
+        associated_token::mint = mint,
+        associated_token::authority = tip,
+        associated_token::token_program = token_program
+    )]
+    pub vault: InterfaceAccount<'info, TokenAccount>,
+    /// CHECK: fee recipient from config.
+    #[account(mut, address = config.treasury @ TipError::WrongTreasury)]
+    pub treasury: UncheckedAccount<'info>,
+    #[account(seeds = [SERVER_SEED, server.server_hash.as_ref()], bump = server.bump)]
+    pub server: Option<Account<'info, ServerLink>>,
+    /// CHECK: the server's payout wallet (checked in `sol_server_cut`).
+    #[account(mut)]
+    pub server_wallet: Option<UncheckedAccount<'info>>,
+    pub token_program: Interface<'info, TokenInterface>,
 }
 
 #[derive(Accounts)]
@@ -934,6 +1128,8 @@ pub enum TipError {
     WrongServer,
     #[msg("No wallet switch is pending")]
     NoPendingRelink,
+    #[msg("Only SOL tips can use this instruction")]
+    NotSol,
 }
 
 #[cfg(test)]
