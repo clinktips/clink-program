@@ -15,7 +15,9 @@
 //! - The linked wallet can remove its link at any time (`unlink_identity`); nobody else can. The
 //!   link's rent goes back to whoever paid it, so a relayer that paid can't be drained this way.
 //! - A relayer that paid the link's rent for a pasted address is paid back once, out of the first
-//!   SOL tip collected; from then on the deposit belongs to the recipient.
+//!   SOL tip collected; from then on the deposit belongs to the recipient. Someone tipped only in a
+//!   token can pay it in that token instead (`claim_tip_with_setup`): the relayer names the amount,
+//!   but never more than the admin's cap for that token (`set_setup_cap`), and only once per link.
 //! - The attestor can link a new identity instantly, but it can never silently move an existing
 //!   link: switching to another wallet waits `RELINK_DELAY_SECS`, tips keep going to the current
 //!   wallet meanwhile, and the current wallet can cancel the switch on its own.
@@ -39,6 +41,7 @@ pub const CONFIG_SEED: &[u8] = b"config";
 pub const LINK_SEED: &[u8] = b"link";
 pub const TIP_SEED: &[u8] = b"tip";
 pub const SERVER_SEED: &[u8] = b"server";
+pub const SETUP_CAP_SEED: &[u8] = b"setup_cap";
 
 pub const MAX_FEE_BPS: u16 = 500; // 5% hard cap
 pub const MIN_REFUND_SECS: i64 = 24 * 60 * 60; // 1 day
@@ -473,6 +476,88 @@ pub mod tip_protocol {
         Ok(())
     }
 
+    /// Admin: the most a relayer may take from a tip in `mint` to pay back a link's one-time setup
+    /// (see `claim_tip_with_setup`). 0 turns it off for that token.
+    pub fn set_setup_cap(ctx: Context<SetSetupCap>, max: u64) -> Result<()> {
+        let cap = &mut ctx.accounts.setup_cap;
+        cap.mint = ctx.accounts.mint.key();
+        cap.max = max;
+        cap.bump = ctx.bumps.setup_cap;
+        Ok(())
+    }
+
+    /// Like `claim_tip`, for a recipient whose link a relayer paid for (they pasted an address) and
+    /// who was tipped in a token rather than SOL: `setup_fee` of the tip goes to the relayer to pay
+    /// back the setup, at most the admin's cap for this token. From then on the deposit belongs to
+    /// the recipient, exactly as after `claim_tip_sol`. Only the relayer that paid can call it.
+    pub fn claim_tip_with_setup(ctx: Context<ClaimTipWithSetup>, setup_fee: u64) -> Result<()> {
+        let a = &ctx.accounts;
+        let wallet_key = a.wallet.key();
+        require_keys_eq!(
+            wallet_key,
+            a.link.current_wallet(Clock::get()?.unix_timestamp),
+            TipError::WrongRecipient
+        );
+        let relayer_paid = a.link.rent_payer != Pubkey::default() && a.link.rent_payer != wallet_key;
+        require!(relayer_paid, TipError::NoSetupDue);
+        require_keys_eq!(a.payer.key(), a.link.rent_payer, TipError::WrongRentPayer);
+        require!(setup_fee <= a.setup_cap.max, TipError::SetupFeeTooHigh);
+
+        let amount = a.vault.amount;
+        let fee = a.config.fee_for(&a.mint.key(), amount);
+        require!(amount - fee >= setup_fee, TipError::TipTooSmallForSetup);
+        let recorded = a.tip.server;
+        let passed = a.server.as_ref().map(|s| s.key()).unwrap_or_default();
+        require_keys_eq!(passed, recorded, TipError::WrongServer);
+        let (server_cut, server_token) =
+            server_payout(&a.config, fee, &a.server, &a.server_token, &a.mint.key())?;
+
+        let tipper_key = a.tip.tipper;
+        let seed_bytes = a.tip.seed.to_le_bytes();
+        let signer: &[&[&[u8]]] = &[&[TIP_SEED, tipper_key.as_ref(), &seed_bytes, &[a.tip.bump]]];
+        let tip_info = a.tip.to_account_info();
+
+        transfer(
+            &a.token_program,
+            &a.vault,
+            &a.recipient_token,
+            tip_info.clone(),
+            &a.mint,
+            amount - fee - setup_fee,
+            signer,
+        )?;
+        transfer(&a.token_program, &a.vault, &a.payer_token, tip_info.clone(), &a.mint, setup_fee, signer)?;
+        transfer(
+            &a.token_program,
+            &a.vault,
+            &a.treasury_token,
+            tip_info.clone(),
+            &a.mint,
+            fee - server_cut,
+            signer,
+        )?;
+        if let Some(server_token) = server_token {
+            transfer(&a.token_program, &a.vault, server_token, tip_info.clone(), &a.mint, server_cut, signer)?;
+        }
+        close_vault(&a.token_program, &a.vault, &a.tipper, tip_info, signer)?;
+
+        emit!(TipClaimed {
+            tip: a.tip.key(),
+            wallet: wallet_key,
+            amount,
+            fee,
+            server_cut,
+        });
+        emit!(SetupRepaid {
+            link: a.link.key(),
+            relayer: a.payer.key(),
+            mint: a.mint.key(),
+            amount: setup_fee,
+        });
+        ctx.accounts.link.rent_payer = wallet_key;
+        Ok(())
+    }
+
     /// Tipper takes back an unclaimed tip after it expired. No fee is charged.
     pub fn refund_tip(ctx: Context<RefundTip>) -> Result<()> {
         let a = &ctx.accounts;
@@ -870,6 +955,97 @@ pub struct ClaimTip<'info> {
 }
 
 #[derive(Accounts)]
+pub struct SetSetupCap<'info> {
+    #[account(seeds = [CONFIG_SEED], bump = config.bump, has_one = admin @ TipError::Unauthorized)]
+    pub config: Account<'info, Config>,
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    pub mint: InterfaceAccount<'info, Mint>,
+    #[account(
+        init_if_needed,
+        payer = admin,
+        space = 8 + SetupCap::INIT_SPACE,
+        seeds = [SETUP_CAP_SEED, mint.key().as_ref()],
+        bump
+    )]
+    pub setup_cap: Account<'info, SetupCap>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ClaimTipWithSetup<'info> {
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    /// The relayer that paid the link's rent (checked in the handler); pays any new token accounts.
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    /// CHECK: must be the identity's current wallet (checked in the handler).
+    pub wallet: UncheckedAccount<'info>,
+    #[account(
+        mut,
+        close = tipper,
+        has_one = tipper,
+        has_one = mint,
+        seeds = [TIP_SEED, tip.tipper.as_ref(), &tip.seed.to_le_bytes()],
+        bump = tip.bump
+    )]
+    pub tip: Box<Account<'info, Tip>>,
+    /// CHECK: receives the rent of the closed tip + vault accounts (checked via has_one).
+    #[account(mut)]
+    pub tipper: UncheckedAccount<'info>,
+    #[account(mint::token_program = token_program)]
+    pub mint: Box<InterfaceAccount<'info, Mint>>,
+    #[account(mut, seeds = [LINK_SEED, tip.identity_hash.as_ref()], bump = link.bump)]
+    pub link: Box<Account<'info, IdentityLink>>,
+    /// The admin's cap for this token; the seeds tie it to `mint`.
+    #[account(seeds = [SETUP_CAP_SEED, mint.key().as_ref()], bump = setup_cap.bump)]
+    pub setup_cap: Box<Account<'info, SetupCap>>,
+    #[account(
+        mut,
+        associated_token::mint = mint,
+        associated_token::authority = tip,
+        associated_token::token_program = token_program
+    )]
+    pub vault: Box<InterfaceAccount<'info, TokenAccount>>,
+    #[account(
+        init_if_needed,
+        payer = payer,
+        associated_token::mint = mint,
+        associated_token::authority = wallet,
+        associated_token::token_program = token_program
+    )]
+    pub recipient_token: Box<InterfaceAccount<'info, TokenAccount>>,
+    /// Where the setup fee goes: the relayer's own token account.
+    #[account(
+        init_if_needed,
+        payer = payer,
+        associated_token::mint = mint,
+        associated_token::authority = payer,
+        associated_token::token_program = token_program
+    )]
+    pub payer_token: Box<InterfaceAccount<'info, TokenAccount>>,
+    /// CHECK: fee recipient from config.
+    #[account(address = config.treasury @ TipError::WrongTreasury)]
+    pub treasury: UncheckedAccount<'info>,
+    #[account(
+        init_if_needed,
+        payer = payer,
+        associated_token::mint = mint,
+        associated_token::authority = treasury,
+        associated_token::token_program = token_program
+    )]
+    pub treasury_token: Box<InterfaceAccount<'info, TokenAccount>>,
+    #[account(seeds = [SERVER_SEED, server.server_hash.as_ref()], bump = server.bump)]
+    pub server: Option<Account<'info, ServerLink>>,
+    /// Payout token account of the server's wallet (checked in `server_payout`).
+    #[account(mut)]
+    pub server_token: Option<InterfaceAccount<'info, TokenAccount>>,
+    pub token_program: Interface<'info, TokenInterface>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 #[instruction(identity_hash: [u8; 32])]
 pub struct TipLinkedSol<'info> {
     #[account(seeds = [CONFIG_SEED], bump = config.bump)]
@@ -1139,6 +1315,23 @@ pub struct ServerLink {
 // Events & errors
 // ---------------------------------------------------------------------------
 
+/// The most a relayer may take from one tip in `mint` for a link's one-time setup.
+#[account]
+#[derive(InitSpace)]
+pub struct SetupCap {
+    pub mint: Pubkey,
+    pub max: u64,
+    pub bump: u8,
+}
+
+#[event]
+pub struct SetupRepaid {
+    pub link: Pubkey,
+    pub relayer: Pubkey,
+    pub mint: Pubkey,
+    pub amount: u64,
+}
+
 #[event]
 pub struct IdentityLinked {
     pub identity_hash: [u8; 32],
@@ -1236,6 +1429,10 @@ pub enum TipError {
     AlreadyMigrated,
     #[msg("The tip is too small to cover the one-time setup")]
     TipTooSmallForSetup,
+    #[msg("Setup fee is above the cap for this token")]
+    SetupFeeTooHigh,
+    #[msg("This link has no setup to pay back")]
+    NoSetupDue,
 }
 
 #[cfg(test)]
