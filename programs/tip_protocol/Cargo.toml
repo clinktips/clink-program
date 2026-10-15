@@ -2,6 +2,8 @@
 name = "tip-protocol"
 version = "0.1.0"
 description = "Non-custodial social tipping on Solana"
+license = "Apache-2.0"
+repository = "https://github.com/clinktips/clink-program"
 edition = "2021"
 # Solana platform-tools ship an older rustc; keeps the lockfile on compatible crate versions.
 rust-version = "1.79"
