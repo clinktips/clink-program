@@ -29,6 +29,7 @@ Tips are addressed to a social identity, `sha256("tipproto:v1:<platform>:<user i
 - The protocol fee is capped at 5% (`MAX_FEE_BPS`) and charged only when a tip is delivered, never on refunds. A server's share comes out of that fee, never out of the tip, and is capped at 75% of it.
 - Pausing blocks new tips only. Claims and refunds always work.
 - An existing link can't be moved silently. Switching to another wallet waits 3 days (`RELINK_DELAY_SECS`); until then tips keep going to the current wallet, and that wallet can cancel the switch on its own (`cancel_relink`).
+- The linked wallet can remove its link at any time (`unlink_identity`); nobody else can. The link's rent goes back to whoever paid it.
 - Only the program's upgrade authority can initialize the config, and admin handovers are two-step (`set_admin`, then `accept_admin` by the new admin).
 
 [SECURITY.md](SECURITY.md) lists what you still have to trust us for and how each part is limited.

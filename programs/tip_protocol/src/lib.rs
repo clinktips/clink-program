@@ -12,6 +12,10 @@
 //! - Pausing blocks new tips only; claims and refunds always work.
 //! - Linking and claiming don't need the recipient's signature (a relayer can pay the fees), but
 //!   escrowed tips can only ever go to the identity's linked wallet.
+//! - The linked wallet can remove its link at any time (`unlink_identity`); nobody else can. The
+//!   link's rent goes back to whoever paid it, so a relayer that paid can't be drained this way.
+//! - A relayer that paid the link's rent for a pasted address is paid back once, out of the first
+//!   SOL tip collected; from then on the deposit belongs to the recipient.
 //! - The attestor can link a new identity instantly, but it can never silently move an existing
 //!   link: switching to another wallet waits `RELINK_DELAY_SECS`, tips keep going to the current
 //!   wallet meanwhile, and the current wallet can cancel the switch on its own.
@@ -43,6 +47,8 @@ pub const MAX_EXEMPT_MINTS: usize = 4;
 pub const MAX_SERVER_SHARE_BPS: u16 = 7_500; // at most 75% of the fee goes to the server
 /// Wrapped SOL. SOL tips sent with the `_sol` instructions arrive as plain SOL instead.
 pub const NATIVE_MINT: Pubkey = pubkey!("So11111111111111111111111111111111111111112");
+/// Size of a link account before `rent_payer` was added (see `migrate_link`).
+pub const LEGACY_LINK_LEN: usize = 8 + 32 + 32 + 8 + 1 + 32 + 8;
 pub const RELINK_DELAY_SECS: i64 = 3 * 24 * 60 * 60; // 3 days to notice and cancel a wallet switch
 
 #[program]
@@ -99,6 +105,7 @@ pub mod tip_protocol {
             link.wallet = wallet;
             link.linked_at = now;
             link.bump = ctx.bumps.link;
+            link.rent_payer = ctx.accounts.payer.key();
             emit!(IdentityLinked {
                 identity_hash,
                 wallet,
@@ -132,6 +139,35 @@ pub mod tip_protocol {
             identity_hash: link.identity_hash,
             wallet: link.wallet,
         });
+        Ok(())
+    }
+
+    /// The linked wallet removes the link; the identity counts as never linked afterwards. Only the
+    /// current wallet can do this, never the attestor or admin. The rent goes back to whoever paid
+    /// it (the wallet itself, or the relayer that linked it for a pasted address).
+    pub fn unlink_identity(ctx: Context<UnlinkIdentity>) -> Result<()> {
+        let link = &mut ctx.accounts.link;
+        link.settle(Clock::get()?.unix_timestamp);
+        require_keys_eq!(ctx.accounts.wallet.key(), link.wallet, TipError::Unauthorized);
+        emit!(IdentityUnlinked {
+            identity_hash: link.identity_hash,
+            wallet: link.wallet,
+        });
+        Ok(())
+    }
+
+    /// Grows a link account created before `rent_payer` existed to the current size. Anyone may pay
+    /// for it; an unknown rent payer means the rent goes back to the wallet on unlink.
+    pub fn migrate_link(ctx: Context<MigrateLink>, identity_hash: [u8; 32]) -> Result<()> {
+        let info = ctx.accounts.link.to_account_info();
+        let (expected, _) = Pubkey::find_program_address(&[LINK_SEED, identity_hash.as_ref()], ctx.program_id);
+        require_keys_eq!(info.key(), expected, TipError::Unauthorized);
+        require_keys_eq!(*info.owner, crate::ID, TipError::Unauthorized);
+        let new_len = 8 + IdentityLink::INIT_SPACE;
+        require!(info.data_len() == LEGACY_LINK_LEN, TipError::AlreadyMigrated);
+        let topup = Rent::get()?.minimum_balance(new_len).saturating_sub(info.lamports());
+        sol_transfer(&ctx.accounts.system_program, &ctx.accounts.payer.to_account_info(), &info, topup)?;
+        info.resize(new_len)?;
         Ok(())
     }
 
@@ -395,6 +431,14 @@ pub mod tip_protocol {
         require_keys_eq!(passed, recorded, TipError::WrongServer);
         let server_cut = sol_server_cut(&a.config, fee, &a.server, &a.server_wallet)?;
 
+        // One-time setup: if a relayer paid this link's rent (the recipient only pasted an address),
+        // the first SOL tip collected pays it back, and the recipient owns the deposit from then on.
+        let wallet_key = a.wallet.key();
+        let relayer_paid = a.link.rent_payer != Pubkey::default() && a.link.rent_payer != wallet_key;
+        // The rent minimum, not the account's balance: extra SOL sent to the link can't raise it.
+        let setup = if relayer_paid { Rent::get()?.minimum_balance(a.link.to_account_info().data_len()) } else { 0 };
+        require!(amount - fee >= setup, TipError::TipTooSmallForSetup);
+
         let tipper_key = a.tip.tipper;
         let seed_bytes = a.tip.seed.to_le_bytes();
         let signer: &[&[&[u8]]] = &[&[TIP_SEED, tipper_key.as_ref(), &seed_bytes, &[a.tip.bump]]];
@@ -405,19 +449,27 @@ pub mod tip_protocol {
         let tip_info = a.tip.to_account_info();
         close_vault(&a.token_program, &a.vault, &tip_info, tip_info.clone(), signer)?;
         tip_info.sub_lamports(amount)?;
-        a.wallet.add_lamports(amount - fee)?;
+        a.wallet.add_lamports(amount - fee - setup)?;
         a.treasury.add_lamports(fee - server_cut)?;
         if let Some(server_wallet) = &a.server_wallet {
             server_wallet.add_lamports(server_cut)?;
         }
+        if setup > 0 {
+            let relayer = a.rent_payer.as_ref().ok_or(TipError::WrongRentPayer)?;
+            require_keys_eq!(relayer.key(), a.link.rent_payer, TipError::WrongRentPayer);
+            relayer.add_lamports(setup)?;
+        }
 
         emit!(TipClaimed {
             tip: a.tip.key(),
-            wallet: a.wallet.key(),
+            wallet: wallet_key,
             amount,
             fee,
             server_cut,
         });
+        if relayer_paid {
+            ctx.accounts.link.rent_payer = wallet_key;
+        }
         Ok(())
     }
 
@@ -611,6 +663,34 @@ pub struct LinkIdentity<'info> {
         bump
     )]
     pub link: Account<'info, IdentityLink>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct UnlinkIdentity<'info> {
+    pub wallet: Signer<'info>,
+    #[account(
+        mut,
+        close = rent_payer,
+        seeds = [LINK_SEED, link.identity_hash.as_ref()],
+        bump = link.bump
+    )]
+    pub link: Account<'info, IdentityLink>,
+    /// CHECK: receives the link's rent: whoever paid it, or the wallet if unknown (old links).
+    #[account(
+        mut,
+        constraint = rent_payer.key() == link.refund_to() @ TipError::WrongRentPayer
+    )]
+    pub rent_payer: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct MigrateLink<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    /// CHECK: a link account in the old layout; address, owner and size are checked in the handler.
+    #[account(mut)]
+    pub link: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
 }
 
@@ -835,7 +915,7 @@ pub struct ClaimTipSol<'info> {
     pub tipper: UncheckedAccount<'info>,
     #[account(address = NATIVE_MINT @ TipError::NotSol, mint::token_program = token_program)]
     pub mint: InterfaceAccount<'info, Mint>,
-    #[account(seeds = [LINK_SEED, tip.identity_hash.as_ref()], bump = link.bump)]
+    #[account(mut, seeds = [LINK_SEED, tip.identity_hash.as_ref()], bump = link.bump)]
     pub link: Account<'info, IdentityLink>,
     #[account(
         mut,
@@ -852,6 +932,9 @@ pub struct ClaimTipSol<'info> {
     /// CHECK: the server's payout wallet (checked in `sol_server_cut`).
     #[account(mut)]
     pub server_wallet: Option<UncheckedAccount<'info>>,
+    /// CHECK: the relayer that paid the link's rent, paid back once (checked in the handler).
+    #[account(mut)]
+    pub rent_payer: Option<UncheckedAccount<'info>>,
     pub token_program: Interface<'info, TokenInterface>,
 }
 
@@ -985,6 +1068,8 @@ pub struct IdentityLink {
     pub pending_wallet: Pubkey,
     /// When `pending_wallet` takes over.
     pub pending_at: i64,
+    /// Who paid this account's rent and gets it back on unlink; the default key for old links.
+    pub rent_payer: Pubkey,
 }
 
 impl IdentityLink {
@@ -1007,6 +1092,15 @@ impl IdentityLink {
             self.wallet = self.pending_wallet;
             self.linked_at = self.pending_at;
             self.clear_pending();
+        }
+    }
+
+    /// Where the rent goes when the link is removed.
+    pub fn refund_to(&self) -> Pubkey {
+        if self.rent_payer == Pubkey::default() {
+            self.wallet
+        } else {
+            self.rent_payer
         }
     }
 
@@ -1057,6 +1151,12 @@ pub struct RelinkRequested {
     pub wallet: Pubkey,
     pub pending_wallet: Pubkey,
     pub effective_at: i64,
+}
+
+#[event]
+pub struct IdentityUnlinked {
+    pub identity_hash: [u8; 32],
+    pub wallet: Pubkey,
 }
 
 #[event]
@@ -1130,6 +1230,12 @@ pub enum TipError {
     NoPendingRelink,
     #[msg("Only SOL tips can use this instruction")]
     NotSol,
+    #[msg("Rent must go back to whoever paid it")]
+    WrongRentPayer,
+    #[msg("This link already has the current layout")]
+    AlreadyMigrated,
+    #[msg("The tip is too small to cover the one-time setup")]
+    TipTooSmallForSetup,
 }
 
 #[cfg(test)]
@@ -1144,6 +1250,7 @@ mod tests {
             bump: 255,
             pending_wallet: Pubkey::default(),
             pending_at: 0,
+            rent_payer: Pubkey::default(),
         }
     }
 
@@ -1173,6 +1280,20 @@ mod tests {
         assert_eq!(l.linked_at, 5_000);
         assert!(!l.has_pending());
         assert_eq!(l.current_wallet(9_999), new);
+    }
+
+    #[test]
+    fn rent_goes_back_to_the_payer_or_the_wallet() {
+        let (wallet, relayer) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let mut l = link(wallet);
+        assert_eq!(l.refund_to(), wallet, "old links: unknown payer, refund the wallet");
+        l.rent_payer = relayer;
+        assert_eq!(l.refund_to(), relayer);
+    }
+
+    #[test]
+    fn legacy_size_matches_the_layout_without_rent_payer() {
+        assert_eq!(LEGACY_LINK_LEN + 32, 8 + IdentityLink::INIT_SPACE);
     }
 
     #[test]
