@@ -14,6 +14,8 @@
 //!   escrowed tips can only ever go to the identity's linked wallet.
 //! - The linked wallet can remove its link at any time (`unlink_identity`); nobody else can. The
 //!   link's rent goes back to whoever paid it, so a relayer that paid can't be drained this way.
+//! - A relayer that paid the link's rent for a pasted address is paid back once, out of the first
+//!   SOL tip collected; from then on the deposit belongs to the recipient.
 //! - The attestor can link a new identity instantly, but it can never silently move an existing
 //!   link: switching to another wallet waits `RELINK_DELAY_SECS`, tips keep going to the current
 //!   wallet meanwhile, and the current wallet can cancel the switch on its own.
@@ -429,6 +431,14 @@ pub mod tip_protocol {
         require_keys_eq!(passed, recorded, TipError::WrongServer);
         let server_cut = sol_server_cut(&a.config, fee, &a.server, &a.server_wallet)?;
 
+        // One-time setup: if a relayer paid this link's rent (the recipient only pasted an address),
+        // the first SOL tip collected pays it back, and the recipient owns the deposit from then on.
+        let wallet_key = a.wallet.key();
+        let relayer_paid = a.link.rent_payer != Pubkey::default() && a.link.rent_payer != wallet_key;
+        // The rent minimum, not the account's balance: extra SOL sent to the link can't raise it.
+        let setup = if relayer_paid { Rent::get()?.minimum_balance(a.link.to_account_info().data_len()) } else { 0 };
+        require!(amount - fee >= setup, TipError::TipTooSmallForSetup);
+
         let tipper_key = a.tip.tipper;
         let seed_bytes = a.tip.seed.to_le_bytes();
         let signer: &[&[&[u8]]] = &[&[TIP_SEED, tipper_key.as_ref(), &seed_bytes, &[a.tip.bump]]];
@@ -439,19 +449,27 @@ pub mod tip_protocol {
         let tip_info = a.tip.to_account_info();
         close_vault(&a.token_program, &a.vault, &tip_info, tip_info.clone(), signer)?;
         tip_info.sub_lamports(amount)?;
-        a.wallet.add_lamports(amount - fee)?;
+        a.wallet.add_lamports(amount - fee - setup)?;
         a.treasury.add_lamports(fee - server_cut)?;
         if let Some(server_wallet) = &a.server_wallet {
             server_wallet.add_lamports(server_cut)?;
         }
+        if setup > 0 {
+            let relayer = a.rent_payer.as_ref().ok_or(TipError::WrongRentPayer)?;
+            require_keys_eq!(relayer.key(), a.link.rent_payer, TipError::WrongRentPayer);
+            relayer.add_lamports(setup)?;
+        }
 
         emit!(TipClaimed {
             tip: a.tip.key(),
-            wallet: a.wallet.key(),
+            wallet: wallet_key,
             amount,
             fee,
             server_cut,
         });
+        if relayer_paid {
+            ctx.accounts.link.rent_payer = wallet_key;
+        }
         Ok(())
     }
 
@@ -897,7 +915,7 @@ pub struct ClaimTipSol<'info> {
     pub tipper: UncheckedAccount<'info>,
     #[account(address = NATIVE_MINT @ TipError::NotSol, mint::token_program = token_program)]
     pub mint: InterfaceAccount<'info, Mint>,
-    #[account(seeds = [LINK_SEED, tip.identity_hash.as_ref()], bump = link.bump)]
+    #[account(mut, seeds = [LINK_SEED, tip.identity_hash.as_ref()], bump = link.bump)]
     pub link: Account<'info, IdentityLink>,
     #[account(
         mut,
@@ -914,6 +932,9 @@ pub struct ClaimTipSol<'info> {
     /// CHECK: the server's payout wallet (checked in `sol_server_cut`).
     #[account(mut)]
     pub server_wallet: Option<UncheckedAccount<'info>>,
+    /// CHECK: the relayer that paid the link's rent, paid back once (checked in the handler).
+    #[account(mut)]
+    pub rent_payer: Option<UncheckedAccount<'info>>,
     pub token_program: Interface<'info, TokenInterface>,
 }
 
@@ -1213,6 +1234,8 @@ pub enum TipError {
     WrongRentPayer,
     #[msg("This link already has the current layout")]
     AlreadyMigrated,
+    #[msg("The tip is too small to cover the one-time setup")]
+    TipTooSmallForSetup,
 }
 
 #[cfg(test)]
