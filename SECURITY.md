@@ -44,4 +44,4 @@ The time lock gives everyone two days to see an upgrade coming. Admin changes ar
 
 ## Reporting a vulnerability
 
-Email **hello@clink.tips** with the subject "security". Please don't open a public issue for anything that could put funds at risk. We'll reply within 48 hours.
+Email **hello@clinktips.com** with the subject "security". Please don't open a public issue for anything that could put funds at risk. We'll reply within 48 hours.
