@@ -11,7 +11,7 @@ These hold no matter what our servers or bots do:
 - **Fixed refund deadline.** It is set when the tip is made and can't be extended.
 - **Capped fees.** At most 5%, charged only on delivery, never on refunds. A server's share comes out of that fee, never out of the tip.
 - **Pausing can't trap funds.** It blocks new tips only.
-- **The one-time setup is capped.** When a relayer pays a new link's account deposit (the recipient only pasted an address), it is paid back once from the first tip collected: exactly the deposit from a SOL tip, or from a token tip an amount the relayer names, which the program refuses above the admin's cap for that token (`set_setup_cap`). After that the deposit belongs to the recipient.
+- **The one-time setup is limited to 10% of a tip.** If you collect by pasting an address, our fee wallet pays the network's account deposits. A tip pays them back once, but only if that's at most 10% of the tip: exactly the deposit from a SOL tip, or from another coin the same amount converted at the current price. The program refuses anything above 10%. If the setup would be more, your tips arrive in full and we keep paying it. Once paid back, the deposit is yours.
 - **Linked wallets can't be moved silently.** See below.
 
 ## What you trust us for, and how it's limited
