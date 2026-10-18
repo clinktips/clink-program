@@ -11,6 +11,7 @@ These hold no matter what our servers or bots do:
 - **Fixed refund deadline.** It is set when the tip is made and can't be extended.
 - **Capped fees.** At most 5%, charged only on delivery, never on refunds. A server's share comes out of that fee, never out of the tip.
 - **Pausing can't trap funds.** It blocks new tips only.
+- **The one-time setup is limited to 10% of a tip.** If you collect by pasting an address, our fee wallet pays the network's account deposits. A tip pays them back once, but only if that's at most 10% of the tip: exactly the deposit from a SOL tip, or from another coin the same amount converted at the current price. The program refuses anything above 10%. If none of your tips is big enough, collecting by pasting isn't offered; connecting a wallet you already have still works, because it pays the setup itself. Once paid back, the deposit is yours.
 - **Linked wallets can't be moved silently.** See below.
 
 ## What you trust us for, and how it's limited
