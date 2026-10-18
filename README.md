@@ -66,7 +66,7 @@ docker run --rm -v "$PWD:/src:ro" solanafoundation/anchor@sha256:21ab8a16e19df43
   for f in target/deploy/tip_protocol.so /tmp/onchain.so; do python3 -c "import sys,hashlib;print(hashlib.sha256(open(sys.argv[1],\"rb\").read().rstrip(b\"\0\")).hexdigest())" $f; done'
 ```
 
-Both lines print the same hash. Trailing zero bytes are stripped first, because the program account is larger than the program. This is the same hash `solana-verify get-program-hash` reports. At the current commit the hash is `0a898fc2672be153c07a64b00d99918b332301300c1b034f0da4d080c71aa339`.
+Both lines print the same hash. Trailing zero bytes are stripped first, because the program account is larger than the program. This is the same hash `solana-verify get-program-hash` reports. At the current commit the hash is `ca8727c4ce3aedc77301f5cd4c98b1ced683c24e82c8a269d8a35e1f4aaff2d3`.
 
 Explorers show a "Verified" badge only on mainnet, because the public verification service doesn't support devnet. The mainnet program will be submitted there at launch.
 
